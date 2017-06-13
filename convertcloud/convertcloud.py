@@ -5,8 +5,9 @@ import sys
 import struct
 import io
 
-from IPython import embed
+import numpy as np
 
+from IPython import embed
 
 class Field:
     def __init__(self, name):
@@ -20,46 +21,54 @@ class Field:
 
 
 class Converter:
-    def __init__(self, path_origin, path_convert):
-        self.basename_ori, self.extension_ori = self.get_name(path_origin)
-        self.basename_conv, self.extension_conv = self.get_name(path_convert)
-
-        self.path_ori = path_origin
-        self.path_conv = path_convert
+    def __init__(self):
 
         self._rgb = None
+        self._rgba = None
         self._decode = None
 
         self.points = []
         self.fields = []
 
-        print("Reading: ", self.path_ori)
-        if self.extension_ori == ".pcd":
-            self.load_pcd()
-        elif self.extension_ori == ".ply":
-            self.load_ply()
-        elif self.extension_ori == ".xyz":
-            self.load_xyz()
+    def load_points(self, path):
+        self.points = []
+        self.fields = []
+
+        print("Reading: ", path)
+        name, extension = self._get_name(path)
+        if extension == ".pcd":
+            self._load_pcd(path)
+        elif extension == ".ply":
+            self._load_ply(path)
+        elif extension == ".zdf":
+            self._load_zdf(path)
+        elif extension == ".xyz":
+            self._load_xyz(path)
         else:
             print("Error: Unknown file extension")
 
-        self.decode_points()
-        self.convert()
+        self._decode_points()
 
-    def get_name(self, path):
+        for field in self.fields:
+            if field.name == 'red' and self._rgba == None:
+                self._rgb = True
+            elif field.name == 'alpha':
+                self._rgba = True
+                self._rgb = False
+
+    def _get_name(self, path):
         """
         Returns basename and extension of path
         """
         return os.path.splitext(os.path.basename(path))
 
-    def load_pcd(self):
+    def _load_pcd(self, path):
         _ascii = False
         _binary = False
         _bcompressed = False
 
         points = 0
-        #print(self.path_ori)
-        with open(self.path_ori, "rb") as f:
+        with open(path, "rb") as f:
             while True:
                 line = f.readline()
                 if line.startswith(b"#"):
@@ -156,16 +165,15 @@ class Converter:
                 self._rgb = True
             for _ in range(points):
                 pt = struct.unpack(fmt, buf.read(size))
-                embed()
                 break
                 self.points.append(pt)
 
-    def load_ply(self):
+    def _load_ply(self, path):
         _ascii = False
         _binary = False
 
         points = 0
-        with open(self.path_ori, "rb") as f:
+        with open(path, "rb") as f:
             while True:
                 line = f.readline()
                 if line.startswith(b"ply"):
@@ -193,8 +201,8 @@ class Converter:
                     line = line.strip()
                     line = line.split(b" ")
 
-                    self.fields.append(Field(line[2]))
-                    self.fields[-1].type = line[1]
+                    self.fields.append(Field(line[2].decode()))
+                    self.fields[-1].type = line[1].decode()
                     self.fields[-1].size = 4
 
                 elif line.startswith(b"end_header"):
@@ -223,85 +231,138 @@ class Converter:
                 pt = struct.unpack(fmt, buf.read(size))
                 self.points.append(pt)
 
-    def load_xyz(self):
-        with open(self.path_ori, 'rb') as f:
+    def _load_zdf(self, path):
+        from netCDF4 import Dataset
+
+        f = Dataset(path,'r')
+        xyz = f['data']['pointcloud'][:,:,:]
+        img = f['data']['rgba_image'][:,:,:]
+        f.close()
+
+        pc = np.dstack([xyz, img])
+        pc_reshaped = pc.reshape(pc.shape[0]*pc.shape[1], pc.shape[2])
+
+        self._rgba = True
+
+        for pt in pc_reshaped:
+            if not np.isnan(pt[0]):
+                self.points.append(pt)
+            else:
+                self.points.append([0,0,0,0,0,0,255])
+
+    def _load_xyz(self, path):
+        with open(path, 'rb') as f:
             for line in f:
                 xyz = line.split()
-                if len(xyz) > 3:
-                    self._rgb = True
                 if xyz[0] != b'nan':
                     self.points.append(xyz)
+                else:
+                    self.points.append(len(xyz)*[0])
 
-    def convert(self):
-        path = self.path_conv
+            if len(xyz) == 6:
+                self._rgb = True
+            elif len(xyz) == 7:
+                self._rgba = True
+
+    def convert(self, path):
         print('Saving point cloud to', path)
-        header = self.generate_header()
+        name, extension = self._get_name(path)
+        header = self._generate_header(extension)
+
         with open(path, "wb") as f:
             f.write(header.encode())
             for pt in self.points:
-                if not self._rgb:
-                    f.write("{} {} {}\n".format(pt[0], pt[1], pt[2]).encode())
+                if self._rgb:
+                    f.write("{} {} {} {} {} {}\n".format(\
+                            pt[0], pt[1], pt[2],\
+                            int(pt[3]), int(pt[4]), int(pt[5])).encode())
+
+                elif self._rgba:
+                    f.write("{} {} {} {} {} {} {}\n".format(\
+                            pt[0], pt[1], pt[2],\
+                            int(pt[3]), int(pt[4]), int(pt[5]), int(pt[6])).encode())
+
                 else:
-                    #TODO: calculate rgb value from three RGB values
-                    # pt[4] = TODO rgb
-                    #f.write("{} {} {} {}\n".format(pt[0], pt[1], pt[2], pt[3]).encode())
                     f.write("{} {} {}\n".format(pt[0], pt[1], pt[2]).encode())
 
-    def generate_header(self):
-        if self.extension_conv == '.ply':
-            header = """ply
-format ascii 1.0
-comment : pcd2ply
-element vertex {}
-property float x
-property float y
-property float z
-end_header\n""".format(len(self.points))
+    def _generate_header(self, extension):
+        if extension == '.ply':
 
-        elif self.extension_conv == '.pcd':
+            properties = "property float x\n" \
+                       + "property float y\n" \
+                       + "property float z\n"
+
             if self._rgb:
-                #TODO calculate rgb value from three R G B values
-                #fields = 'x y z rgb'
-                #size = '4 4 4 4'
-                #typ = 'F F F 4'
-                fields = 'x y z'
-                size = '4 4 4'
-                typ = 'F F F'
-            else:
-                fields = 'x y z'
-                size = '4 4 4'
-                typ = 'F F F'
+                properties += "property uchar red\n" \
+                            + "property uchar green\n" \
+                            + "property uchar blue\n"
+            elif self._rgba:
+                properties += "property uchar red\n" \
+                            + "property uchar green\n" \
+                            + "property uchar blue\n" \
+                            + "property uchar alpha\n"
 
-            header = """# .PCD v0.7 - PointCloud Data file format
-VERSION 0.7
-FIELDS {0}
-SIZE {1}
-TYPE {2}
-WIDTH {3}
-HEIGHT 1
-VIEWPOINT 0 0 0 1 0 0 0
-POINTS {4}
-DATA ascii\n""".format(fields, size, typ, len(self.points), len(self.points))
+            header = 'ply\n' \
+                   + "format ascii 1.0\n" \
+                   + "comment https://github.com/SintefRaufossManufacturing/pcd2ply\n" \
+                   + "element vertex {}\n".format(len(self.points)) \
+                   + properties \
+                   + "end_header\n"
 
-        elif self.extension_conv == '.xyz':
+        elif extension == '.pcd':
+            fields = "x y z"
+            size = "4 4 4"
+            typ = "F F F"
+            if self._rgb or self._rgba:
+                #TODO calculate rgb value from three R G B values (bitshift)
+                fields += " r g b"
+                size += " 4 4 4"
+                typ += " 4 4 4"
+            elif self._rgba:
+                fields += " r g b a"
+                size += " 4 4 4 4"
+                typ += " 4 4 4 4"
+
+            header = "# .PCD v0.7 - PointCloud Data file format\n" \
+                   + "VERSION 0.7\n" \
+                   + "FIELDS {}\n".format(fields) \
+                   + "SIZE {}\n".format(size) \
+                   + "TYPE {}\n".format(typ) \
+                   + "WIDTH {}\n".format(len(self.points)) \
+                   + "HEIGHT 1\n" \
+                   + "VIEWPOINT 0 0 0 1 0 0 0\n" \
+                   + "POINTS {}\n".format(len(self.points)) \
+                   + "DATA ascii\n"
+
+        elif extension == '.xyz':
             header = ''
 
         else:
-            print("Error: Can't convert to {}".format(self.extension_conv))
+            print("Error: Can't convert to {}".format(extension))
             sys.exit(1)
 
         return header
 
-    def decode_points(self):
-        for num, pt in enumerate(self.points):
-            self.points[num] = [pt[0].decode(), pt[1].decode(), pt[2].decode()]
+    def _decode_points(self):
+        for num, point in enumerate(self.points):
+            if isinstance(point[0], bytes):
+                self.points[num] = [val.decode() for val in point]
+            else:
+                break
 
+        self.points = np.array(self.points).astype("float32")
+                
+            
 def main():
     if len(sys.argv) != 3:
         print("usage: converter <original.format1> <converted.format2>")
-        print("formats supported: .ply, .pcd, .xyz, .xyz+RGB")
+        print("formats supported: .ply, .pcd, .xyz, .zdf")
         sys.exit(1)
-    c = Converter(sys.argv[1], sys.argv[2])
+
+    c = Converter()
+
+    c.load_points(sys.argv[1])
+    c.convert(sys.argv[2])
 
 if __name__ == "__main__":
     main()
